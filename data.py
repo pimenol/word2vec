@@ -88,3 +88,26 @@ def compute_subsample_probs(freqs, threshold):
     f = freqs / total
     prob_keep = np.sqrt(threshold / f) + (threshold / f)
     return np.minimum(prob_keep, 1.0).astype(np.float32)
+
+
+def build_neg_table(freqs, table_size):
+    """
+    Build a unigram^(3/4) table for O(1) negative sampling.
+
+    The 3/4 power smooths the distribution: upweights rare words relative
+    to their raw frequency, preventing the most common words from dominating
+    the negative samples.  Found empirically by Mikolov et al.
+    """
+    powered = np.power(freqs, 0.75)
+    probs = powered / powered.sum()
+    table = np.zeros(table_size, dtype=np.int32)
+    cumsum = np.cumsum(probs)
+    idx = 0
+    for i in range(len(probs)):
+        end = min(int(round(cumsum[i] * table_size)), table_size)
+        if end > idx:
+            table[idx:end] = i
+            idx = end
+    if idx < table_size:
+        table[idx:] = len(probs) - 1
+    return table
