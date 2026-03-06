@@ -14,6 +14,9 @@ class Config:
     data_dir = 'data'
     results_dir = 'results'
 
+    # Position-dependent context weighting (1/d)
+    use_position_weights = False
+
     # Adaptive Frequency-Based Window Sizing
     use_afws = False
     afws_min_window = 3

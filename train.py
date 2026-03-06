@@ -4,12 +4,30 @@ import numpy as np
 
 from evaluate import evaluate_analogies
 from math_utils import log_sigmoid, sigmoid
-from pairs import generate_pairs_afws, generate_pairs_vectorized
+from pairs import generate_pairs_afws, generate_pairs_vectorized, generate_pairs_weighted
 
 
 def train_batch(W_in, W_out, centers, pos_ids, neg_ids, lr):
     """
     Vectorized SGNS forward-backward-update for one mini-batch.
+
+    Hybrid approach: vectorized dot products and center gradient via einsum,
+    then loop over K for negative updates (avoids large outer-product
+    allocation while keeping scattered writes small and cache-friendly).
+
+    Uses regular fancy indexing for updates (not np.add.at) for speed.
+    Duplicate indices lose some gradient accumulation, which is acceptable
+    for SGD — equivalent to a slight per-word learning rate reduction.
+
+    Loss per sample:
+        L = -log sigmoid(v_c · v_o) - sigmoid_k log sigmoid(-v_c · v_{n_k})
+
+    Gradients (per sample):
+        ∂L/∂v_c     = (sigmoid(v_c·v_o) - 1)·v_o  + sigmoid_k sigmoid(v_c·v_{n_k})·v_{n_k}
+        ∂L/∂v_o     = (sigmoid(v_c·v_o) - 1)·v_c
+        ∂L/∂v_{n_k} = sigmoid(v_c·v_{n_k})·v_c
+
+    Returns average loss per sample (scalar).
     """
     B = len(centers)
     K = neg_ids.shape[1]
@@ -46,6 +64,155 @@ def train_batch(W_in, W_out, centers, pos_ids, neg_ids, lr):
         W_out[neg_ids[:, k]] -= lr * (neg_sig[:, k:k+1] * vc)
 
     return float(loss)
+
+
+def train_batch_weighted(W_in, W_out, centers, pos_ids, neg_ids, weights, lr):
+    """
+    SGNS forward-backward-update with per-sample position weights.
+
+    Identical to train_batch but each sample's gradient is scaled by
+    weights[i] = 1/d where d is the distance from center to context.
+
+    Loss per sample:
+        L = w_i * [-log sigmoid(v_c · v_o) - Σ_k log sigmoid(-v_c · v_{n_k})]
+
+    Gradients (per sample):
+        ∂L/∂v_c     = w_i * [(σ(v_c·v_o) - 1)·v_o  + Σ_k σ(v_c·v_{n_k})·v_{n_k}]
+        ∂L/∂v_o     = w_i * [(σ(v_c·v_o) - 1)·v_c]
+        ∂L/∂v_{n_k} = w_i * [σ(v_c·v_{n_k})·v_c]
+
+    Returns average weighted loss per sample.
+    """
+    B = len(centers)
+    K = neg_ids.shape[1]
+    w = weights  # (B,) — 1/d values
+
+    vc = W_in[centers]       # (B, D)
+    vo = W_out[pos_ids]      # (B, D)
+    vn = W_out[neg_ids]      # (B, K, D)
+
+    pos_dot = np.sum(vc * vo, axis=1)
+    neg_dot = np.einsum('bd,bkd->bk', vc, vn)
+    np.clip(pos_dot, -10, 10, out=pos_dot)
+    np.clip(neg_dot, -10, 10, out=neg_dot)
+
+    pos_sig = sigmoid(pos_dot)
+    neg_sig = sigmoid(neg_dot)
+    loss = (-log_sigmoid(pos_dot) * w).sum() / B - (log_sigmoid(-neg_dot) * w[:, None]).sum() / B
+
+    pos_coeff = pos_sig - 1.0    # (B,)
+
+    # Scale coefficients by weight
+    w_pos_coeff = pos_coeff * w  # (B,)
+    w_neg_sig = neg_sig * w[:, None]  # (B, K)
+
+    grad_vc = (w_pos_coeff[:, None] * vo
+               + np.einsum('bk,bkd->bd', w_neg_sig, vn))  # (B, D)
+
+    W_in[centers]  -= lr * grad_vc
+    W_out[pos_ids] -= lr * (w_pos_coeff[:, None] * vc)
+
+    for k in range(K):
+        W_out[neg_ids[:, k]] -= lr * (w_neg_sig[:, k:k+1] * vc)
+
+    return float(loss)
+
+
+def gradient_check_weighted(save_path=None):
+    """
+    Verify analytic gradients for position-weighted SGNS vs finite-difference.
+    V=20, D=5, B=2, K=3.  All relative errors must be < 1e-5.
+    """
+    rng = np.random.default_rng(42)
+    V, D, K = 20, 5, 3
+    Wi = rng.standard_normal((V, D)) * 0.1
+    Wo = rng.standard_normal((V, D)) * 0.1
+
+    centers = np.array([3, 7])
+    pos_ids = np.array([5, 12])
+    neg_ids = np.array([[1, 8, 15], [2, 9, 18]])
+    weights = np.array([1.0, 0.5])  # e.g. 1/d=1, 1/d=0.5
+    B = 2
+
+    def loss_fn(Wi, Wo):
+        vc = Wi[centers]; vo = Wo[pos_ids]
+        L = 0.0
+        for b in range(B):
+            L += weights[b] * (-log_sigmoid(np.dot(vc[b], vo[b])))
+            for k in range(K):
+                nk = Wo[neg_ids[b, k]]
+                L += weights[b] * (-log_sigmoid(-np.dot(vc[b], nk)))
+        return L / B
+
+    # Analytic gradients
+    vc = Wi[centers]; vo = Wo[pos_ids]
+    pd = np.sum(vc * vo, axis=1)
+    ps = sigmoid(pd); pc = ps - 1.0
+    g_vc = (pc * weights)[:, None] * vo
+    g_vo = (pc * weights)[:, None] * vc
+    g_vn = np.zeros((B, K, D))
+    for k in range(K):
+        nk = Wo[neg_ids[:, k]]
+        nd = np.sum(vc * nk, axis=1)
+        ns = sigmoid(nd)
+        g_vc += (ns * weights)[:, None] * nk
+        g_vn[:, k, :] = (ns * weights)[:, None] * vc
+    g_vc /= B; g_vo /= B; g_vn /= B
+
+    eps = 1e-5
+    lines = []
+    def report(msg):
+        print(msg); lines.append(msg)
+
+    report("=" * 60)
+    report("GRADIENT VERIFICATION — POSITION-WEIGHTED SGNS")
+    report(f"  Model: V={V}, D={D}, K={K}, B={B}")
+    report(f"  Weights: {weights}")
+    report("=" * 60)
+
+    def check(name, param, indices, analytic):
+        me = 0.0
+        for bi in range(len(indices)):
+            for d in range(D):
+                orig = param[indices[bi], d]
+                param[indices[bi], d] = orig + eps
+                lp = loss_fn(Wi, Wo)
+                param[indices[bi], d] = orig - eps
+                lm = loss_fn(Wi, Wo)
+                param[indices[bi], d] = orig
+                num = (lp - lm) / (2 * eps)
+                ana = analytic[bi, d] if analytic.ndim == 2 else analytic[bi]
+                me = max(me, abs(num - ana) / (max(abs(num), abs(ana)) + 1e-12))
+        ok = me < 1e-5
+        report(f"  {name:25s} max rel error: {me:.2e}  {'PASS' if ok else 'FAIL'}")
+        return ok
+
+    p1 = check("W_in  (center)",   Wi, centers, g_vc)
+    p2 = check("W_out (positive)", Wo, pos_ids, g_vo)
+
+    me3 = 0.0
+    for k in range(K):
+        for bi in range(B):
+            for d in range(D):
+                orig = Wo[neg_ids[bi, k], d]
+                Wo[neg_ids[bi, k], d] = orig + eps
+                lp = loss_fn(Wi, Wo)
+                Wo[neg_ids[bi, k], d] = orig - eps
+                lm = loss_fn(Wi, Wo)
+                Wo[neg_ids[bi, k], d] = orig
+                num = (lp - lm) / (2 * eps)
+                ana = g_vn[bi, k, d]
+                me3 = max(me3, abs(num - ana) / (max(abs(num), abs(ana)) + 1e-12))
+    p3 = me3 < 1e-5
+    report(f"  {'W_out (negative)':25s} max rel error: {me3:.2e}  {'PASS' if p3 else 'FAIL'}")
+
+    ok = p1 and p2 and p3
+    report(f"\n  OVERALL: {'ALL CHECKS PASSED' if ok else 'SOME CHECKS FAILED'}")
+
+    if save_path:
+        with open(save_path, 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+    return ok
 
 
 def gradient_check(save_path=None):
@@ -198,7 +365,11 @@ def train(cfg, corpus_ids, keep_probs, neg_table, freqs, vocab_size,
             if len(filt) < 2:
                 continue
 
-            if cfg.use_afws:
+            use_pw = getattr(cfg, 'use_position_weights', False)
+
+            if use_pw:
+                pairs = generate_pairs_weighted(filt, cfg.window_size, rng)
+            elif cfg.use_afws:
                 pairs = generate_pairs_afws(
                     filt, freqs_f32, cfg.afws_max_window,
                     cfg.afws_min_window, cfg.afws_alpha, rng)
@@ -221,7 +392,13 @@ def train(cfg, corpus_ids, keep_probs, neg_table, freqs, vocab_size,
                 progress = min(processed / max(total_est, 1), 1.0)
                 lr = max(cfg.lr_start * (1.0 - progress), cfg.lr_min)
 
-                loss = train_batch(W_in, W_out, c_ids, p_ids, n_ids, lr)
+                if use_pw:
+                    dists = batch[:, 2].astype(np.float32)
+                    w = 1.0 / dists  # position weight = 1/d
+                    loss = train_batch_weighted(
+                        W_in, W_out, c_ids, p_ids, n_ids, w, lr)
+                else:
+                    loss = train_batch(W_in, W_out, c_ids, p_ids, n_ids, lr)
 
                 processed += B
                 run_loss += loss
