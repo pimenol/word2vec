@@ -77,3 +77,14 @@ def tokens_to_ids(tokens, word2idx):
             ids[n] = idx
             n += 1
     return ids[:n]
+
+
+def compute_subsample_probs(freqs, threshold):
+    """
+    Compute keep-probability for subsampling frequent words.
+    P(keep) = sqrt(t / f(w)) + t / f(w), capped at 1.
+    """
+    total = freqs.sum()
+    f = freqs / total
+    prob_keep = np.sqrt(threshold / f) + (threshold / f)
+    return np.minimum(prob_keep, 1.0).astype(np.float32)
