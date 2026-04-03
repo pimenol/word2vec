@@ -154,7 +154,3 @@ REPORT.md            Full technical report (gradients, training phases, analysis
 - Post-processing theory and ablation (why removing top-2 PCA components helps)
 - AFWS experiment design, results, and failure analysis
 - Compute budget (~16 hours, ~6.9B training pairs across all phases)
-
-## License
-
-[MIT](LICENSE)
