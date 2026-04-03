@@ -394,7 +394,8 @@ def train(cfg, corpus_ids, keep_probs, neg_table, freqs, vocab_size,
 
                 if use_pw:
                     dists = batch[:, 2].astype(np.float32)
-                    w = 1.0 / dists  # position weight = 1/d
+                    pw_power = getattr(cfg, 'position_weight_power', 1.0)
+                    w = 1.0 / np.power(dists, pw_power)  # 1/d^p
                     loss = train_batch_weighted(
                         W_in, W_out, c_ids, p_ids, n_ids, w, lr)
                 else:

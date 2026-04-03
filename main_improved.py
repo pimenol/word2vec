@@ -170,8 +170,15 @@ def main():
     comparison_rows = []
 
     # ── Load or train baseline ─────────────────────────────────────────
+    # Prefer existing Phase 7 (K=15 fine-tuned) checkpoint
+    ft_path = os.path.join(cfg.results_dir, 'model_k15_ft.npz')
     baseline_path = os.path.join(cfg.results_dir, 'model_base.npz')
-    if os.path.exists(baseline_path):
+    if os.path.exists(ft_path):
+        log("\nLoading Phase 7 (K=15 fine-tuned) model as baseline...")
+        data = np.load(ft_path)
+        Wi_base = data['W_in']
+        Wo_base = data['W_out']
+    elif os.path.exists(baseline_path):
         log("\nLoading baseline model from checkpoint...")
         data = np.load(baseline_path)
         Wi_base = data['W_in']

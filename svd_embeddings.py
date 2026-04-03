@@ -1,7 +1,11 @@
 """SVD-based embeddings from explicit PPMI matrix (Levy & Goldberg 2014).
 
-Builds a word-word co-occurrence matrix from the corpus, converts it to
-Shifted Positive PMI (SPPMI), and applies truncated SVD to obtain embeddings.
+Memory-efficient implementation for systems with limited RAM:
+- Uses reduced vocabulary (top N words) for co-occurrence matrix
+- In-place SPPMI computation
+- Randomized truncated SVD (Halko et al. 2011)
+- Extends SVD embeddings to full vocabulary via SGNS fallback
+
 All operations use pure NumPy.
 """
 
@@ -10,25 +14,31 @@ import time
 import numpy as np
 
 
-def build_cooccurrence_matrix(corpus_ids, vocab_size, window, weighted=True):
+def build_cooccurrence_matrix(corpus_ids, vocab_size, window,
+                              weighted=True, max_vocab=None):
     """
     Build a dense co-occurrence matrix from the corpus.
 
-    If weighted=True, each co-occurrence at distance d contributes 1/d.
-    Otherwise each contributes 1.
+    Args:
+        corpus_ids: array of word integer IDs
+        vocab_size: total vocabulary size
+        window: context window size
+        weighted: if True, weight by 1/d
+        max_vocab: if set, only track top max_vocab words (by ID, which is
+                   sorted by frequency). Words with ID >= max_vocab are ignored.
 
     Returns:
-        C: (V, V) float64 co-occurrence matrix (symmetric)
+        C: (V_eff, V_eff) float32 co-occurrence matrix (symmetric)
+        V_eff: effective vocabulary size used
     """
-    print(f"    Building co-occurrence matrix (V={vocab_size}, "
+    V_eff = min(vocab_size, max_vocab) if max_vocab else vocab_size
+    print(f"    Building co-occurrence matrix (V_eff={V_eff}, "
           f"window={window}, weighted={weighted})...")
     t0 = time.time()
     n = len(corpus_ids)
-    # Use float64 for accumulation precision
-    C = np.zeros((vocab_size, vocab_size), dtype=np.float64)
+    C = np.zeros((V_eff, V_eff), dtype=np.float32)
 
-    # Process in chunks for efficiency
-    chunk_size = 100_000
+    chunk_size = 200_000
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
         chunk = corpus_ids[start:end]
@@ -37,10 +47,13 @@ def build_cooccurrence_matrix(corpus_ids, vocab_size, window, weighted=True):
                 break
             centers = chunk[:len(chunk) - d]
             contexts = chunk[d:]
-            weight = 1.0 / d if weighted else 1.0
-            # Accumulate both directions
-            np.add.at(C, (centers, contexts), weight)
-            np.add.at(C, (contexts, centers), weight)
+            # Only keep pairs where both words are in reduced vocab
+            mask = (centers < V_eff) & (contexts < V_eff)
+            c_valid = centers[mask]
+            x_valid = contexts[mask]
+            weight = np.float32(1.0 / d if weighted else 1.0)
+            np.add.at(C, (c_valid, x_valid), weight)
+            np.add.at(C, (x_valid, c_valid), weight)
 
         if (start // chunk_size) % 20 == 0 and start > 0:
             elapsed = time.time() - t0
@@ -49,114 +62,143 @@ def build_cooccurrence_matrix(corpus_ids, vocab_size, window, weighted=True):
 
     elapsed = time.time() - t0
     nnz = np.count_nonzero(C)
-    print(f"    Done. {nnz:,} non-zero entries ({elapsed:.0f}s)")
-    return C
+    mem_mb = C.nbytes / 1e6
+    print(f"    Done. {nnz:,} non-zero entries, {mem_mb:.0f} MB ({elapsed:.0f}s)")
+    return C, V_eff
 
 
-def compute_sppmi(C, neg_k=15):
+def compute_sppmi_inplace(C, neg_k=15):
     """
-    Compute Shifted Positive PMI from co-occurrence matrix.
+    Compute Shifted Positive PMI from co-occurrence matrix IN-PLACE.
+    Overwrites C with SPPMI to save memory.
 
     SPPMI[i,j] = max(PMI[i,j] - log(k), 0)
-    where PMI[i,j] = log(C[i,j] * |D| / (sum_j C[i,j] * sum_i C[i,j]))
-    and k is the number of negative samples.
-
-    Args:
-        C: (V, V) co-occurrence matrix
-        neg_k: negative sample count for the shift
-
-    Returns:
-        SPPMI: (V, V) shifted positive PMI matrix
     """
-    print(f"    Computing SPPMI (k={neg_k})...")
+    print(f"    Computing SPPMI in-place (k={neg_k})...")
     t0 = time.time()
 
-    D = C.sum()  # total co-occurrences
+    D = float(C.sum())
     if D == 0:
-        return np.zeros_like(C)
+        return C
 
-    row_sums = C.sum(axis=1)  # (V,)
-    col_sums = C.sum(axis=0)  # (V,)
-
-    # Avoid division by zero
+    row_sums = C.sum(axis=1)
+    col_sums = C.sum(axis=0)
     row_sums = np.maximum(row_sums, 1e-10)
     col_sums = np.maximum(col_sums, 1e-10)
 
-    # PMI = log(C[i,j] * D / (row_sums[i] * col_sums[j]))
-    # SPPMI = max(PMI - log(k), 0)
-    # Do this in chunks to manage memory for large V
+    log_D = np.log(D)
+    log_shift = np.log(float(neg_k))
+    log_row = np.log(row_sums.astype(np.float64))
+    log_col = np.log(col_sums.astype(np.float64))
+
     V = C.shape[0]
-    SPPMI = np.zeros_like(C)
-
-    log_shift = np.log(neg_k)
-
-    # Process in row chunks to avoid V*V temporary arrays
-    chunk = 1000
+    chunk = 2000
     for i in range(0, V, chunk):
         end = min(i + chunk, V)
-        block = C[i:end]  # (chunk, V)
-        # Only compute where C > 0
-        mask = block > 0
-        if not mask.any():
+        block = C[i:end]  # view into C
+        nz_rows, nz_cols = np.nonzero(block)
+        if len(nz_rows) == 0:
+            block[:] = 0
             continue
-        # PMI for non-zero entries
-        pmi = np.zeros_like(block)
-        pmi[mask] = (np.log(block[mask] * D)
-                     - np.log(row_sums[i:end, None] * np.ones((1, V)))[mask]
-                     - np.log(col_sums[None, :] * np.ones((end - i, 1)))[mask])
-        # Shift and clip
-        SPPMI[i:end] = np.maximum(pmi - log_shift, 0.0)
+        vals = block[nz_rows, nz_cols].astype(np.float64)
+        pmi_vals = np.log(vals) + log_D - log_row[i + nz_rows] - log_col[nz_cols]
+        pmi_vals = np.maximum(pmi_vals - log_shift, 0.0)
+        block[:] = 0
+        block[nz_rows, nz_cols] = pmi_vals.astype(np.float32)
 
     elapsed = time.time() - t0
-    nnz = np.count_nonzero(SPPMI)
+    nnz = np.count_nonzero(C)
     print(f"    Done. {nnz:,} non-zero SPPMI entries ({elapsed:.0f}s)")
-    return SPPMI
+    return C
+
+
+def randomized_svd(M, dim=300, n_oversamples=20, n_power_iter=2):
+    """
+    Randomized truncated SVD (Halko, Martinsson, Tropp 2011).
+
+    Returns: U (V, dim), S (dim,)
+    """
+    print(f"    Randomized SVD (dim={dim}, oversamples={n_oversamples}, "
+          f"power_iter={n_power_iter})...")
+    t0 = time.time()
+    V = M.shape[0]
+    k = dim + n_oversamples
+
+    rng = np.random.default_rng(42)
+    Omega = rng.standard_normal((V, k)).astype(np.float32)
+    Y = M @ Omega
+
+    for i in range(n_power_iter):
+        print(f"      Power iteration {i+1}/{n_power_iter}...")
+        Y, _ = np.linalg.qr(Y)
+        Z = M.T @ Y
+        Z, _ = np.linalg.qr(Z)
+        Y = M @ Z
+
+    Q, _ = np.linalg.qr(Y)
+    del Y
+    B = Q.T @ M  # (k, V)
+
+    U_b, S, _ = np.linalg.svd(B, full_matrices=False)
+    del B
+    U = Q @ U_b
+    del Q, U_b
+
+    U = U[:, :dim]
+    S = S[:dim]
+
+    elapsed = time.time() - t0
+    print(f"    Done ({elapsed:.0f}s). U: {U.shape}, "
+          f"S range: [{S[-1]:.2f}, {S[0]:.2f}]")
+    return U, S
 
 
 def svd_embeddings(M, dim=300, power=0.5):
     """
-    Compute truncated SVD embeddings from a matrix M.
+    Compute embeddings from SPPMI matrix using randomized SVD.
 
-    Embeddings = U_d * Sigma_d^power
-
-    For large V, we use the eigendecomposition trick:
-    M M^T = U Sigma^2 U^T, so we compute eigh of M M^T.
+    Embeddings = U * Sigma^power
 
     Args:
-        M: (V, V) matrix (e.g. SPPMI)
+        M: (V_eff, V_eff) SPPMI matrix
         dim: embedding dimension
-        power: exponent for singular values (0=U only, 0.5=balanced, 1=full)
+        power: exponent for singular values
 
     Returns:
-        W: (V, dim) embedding matrix
+        W: (V_eff, dim) embedding matrix
     """
-    print(f"    Computing SVD (dim={dim}, power={power})...")
-    t0 = time.time()
-    V = M.shape[0]
-
-    # For symmetric matrices, eigendecomposition is equivalent and faster
-    # M = U S U^T for symmetric M
-    # Use: M M^T has same eigenvectors, eigenvalues are S^2
-    # Since SPPMI is symmetric, we can use eigh directly
-    print(f"      Using eigendecomposition on {V}x{V} symmetric matrix...")
-    eigenvalues, eigenvectors = np.linalg.eigh(M)
-
-    # eigh returns eigenvalues in ascending order; we want the largest
-    idx = np.argsort(-np.abs(eigenvalues))[:dim]
-    eigenvalues = eigenvalues[idx]
-    eigenvectors = eigenvectors[:, idx]
-
-    # Eigenvalues of SPPMI should be non-negative (it's PSD after clipping)
-    # but numerical issues can make some slightly negative
-    eigenvalues = np.maximum(eigenvalues, 0.0)
-
-    # Embeddings: eigenvectors * eigenvalues^power
-    # (analogous to U * Sigma^power from SVD)
-    W = eigenvectors * np.power(eigenvalues + 1e-10, power)[None, :]
-
-    elapsed = time.time() - t0
-    print(f"    Done ({elapsed:.0f}s). Embedding shape: {W.shape}")
+    U, S = randomized_svd(M, dim=dim)
+    S = np.maximum(S, 0.0)
+    W = U * np.power(S + 1e-10, power)[None, :]
+    print(f"    Embedding shape: {W.shape}, power={power}")
     return W.astype(np.float32)
+
+
+def extend_svd_to_full_vocab(W_svd, W_sgns, V_eff, V_full):
+    """
+    Extend SVD embeddings from reduced to full vocabulary.
+
+    For words in the reduced vocab (ID < V_eff), use SVD embeddings.
+    For words outside (ID >= V_eff), use SGNS embeddings projected
+    into the SVD space via truncated least-squares.
+
+    In practice, for blending we just use the SVD embeddings directly
+    for the reduced vocab and SGNS for the rest.
+    """
+    W_full = np.zeros((V_full, W_svd.shape[1]), dtype=np.float32)
+    W_full[:V_eff] = W_svd
+
+    if V_full > V_eff:
+        # For OOV words, use SGNS embeddings (already available)
+        # Project them into SVD space approximately
+        # Simple approach: use SGNS embeddings directly (they're the
+        # best we have for rare words anyway)
+        norms_svd = np.linalg.norm(W_svd, axis=1, keepdims=True) + 1e-8
+        mean_norm = norms_svd.mean()
+        norms_sgns = np.linalg.norm(W_sgns[V_eff:], axis=1, keepdims=True) + 1e-8
+        W_full[V_eff:] = W_sgns[V_eff:] / norms_sgns * mean_norm
+
+    return W_full
 
 
 def blend_embeddings(W_sgns, W_svd, alpha=0.5):
@@ -185,15 +227,11 @@ def postprocess_embeddings(W, n_components=2):
     mean = Wn.mean(axis=0)
     Wn -= mean
 
-    # PCA: compute top-k components
-    # For efficiency, use covariance matrix approach
     cov = Wn.T @ Wn / Wn.shape[0]
     eigenvalues, eigenvectors = np.linalg.eigh(cov)
-    # Top components (largest eigenvalues, returned in ascending order)
-    top_components = eigenvectors[:, -n_components:]  # (D, k)
+    top_components = eigenvectors[:, -n_components:]
 
-    # Remove projections onto top components
-    projections = Wn @ top_components  # (V, k)
+    projections = Wn @ top_components
     Wn -= projections @ top_components.T
 
     return Wn.astype(np.float32)
